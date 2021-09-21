@@ -11,6 +11,7 @@ import * as tmp from 'tmp';
 import * as fs from 'fs';
 import * as execa from 'execa';
 import * as Diff from 'diff';
+import { Readable } from 'stream';
 
 type ObjectPath = {
   Bucket: string;
@@ -63,15 +64,27 @@ const fetchObject: FetchObject = ({ client, isUtf8 }) => async ({ Bucket, Key })
         Key,
       })
     );
-    if (!isUtf8(s3Object)) {
+    if (!isUtf8(s3Object) || s3Object.Body == null) {
       throw new CustomError(`Cannot handle non-utf8 object.`);
     }
-    return s3Object.Body?.toString() || '';
+    return await streamToString(s3Object.Body as Readable);
   } catch (e) {
-    if (e.name === 'NotFound') {
+    if (e.name === 'NoSuchKey') {
       return null;
     }
+    if (e.name === 'NoSuchBucket') {
+      throw new CustomError(`Bucket not found: '${Bucket}'`);
+    }
     throw e;
+  }
+
+  async function streamToString(stream: Readable): Promise<string> {
+    return await new Promise((resolve, reject) => {
+      const chunks: Uint8Array[] = [];
+      stream.on('data', chunk => chunks.push(chunk));
+      stream.on('error', reject);
+      stream.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
+    });
   }
 };
 
@@ -110,7 +123,7 @@ const parseObjectPath: ParseObjectPath = path => {
 };
 
 const isUtf8: IsUtf8 = data => {
-  return require('utf-8-validate')(data.Body);
+  return data.ContentEncoding === 'utf-8';
 };
 
 /**
@@ -134,7 +147,8 @@ const pushObject: PushObject = ({ client }) => async (objectPath, data, acl) => 
     new PutObjectCommand({
       Bucket: objectPath.Bucket,
       Key: objectPath.Key,
-      ContentType: 'utf-8',
+      ContentType: objectPath.Ext === 'json' ? 'application/json' : 'text/plain',
+      ContentEncoding: 'utf-8',
       ACL: acl,
       Body: data,
     })
@@ -149,6 +163,7 @@ const selectACL: SelectACL = async () => {
     {
       name: 'acl',
       type: 'select',
+      message: 'Select ACL',
       choices: [
         { title: 'private', value: 'private', selected: true },
         { title: 'public-read', value: 'public-read' },
@@ -178,7 +193,7 @@ const showDiff: ShowDiff = (prev, next) => {
  */
 const ensureJsonString: EnsureJsonString = text => {
   try {
-    return JSON5.stringify(JSON5.parse(text), null, 2);
+    return JSON.stringify(JSON5.parse(text), null, 2);
   } catch {
     throw new CustomError(`with ext '.json' should be JSON format`);
   }
