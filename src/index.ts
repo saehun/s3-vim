@@ -1,11 +1,16 @@
 import {
-  ObjectCannedACL as ACL,
-  S3Client,
   GetObjectCommand,
   GetObjectCommandOutput,
-  GetObjectAclCommand,
+  ObjectCannedACL as ACL,
+  PutObjectCommand,
+  S3Client,
 } from '@aws-sdk/client-s3';
 import * as JSON5 from 'json5';
+import * as prompts from 'prompts';
+import * as tmp from 'tmp';
+import * as fs from 'fs';
+import * as execa from 'execa';
+import * as Diff from 'diff';
 
 type ObjectPath = {
   Bucket: string;
@@ -15,7 +20,7 @@ type ObjectPath = {
 
 type ParseObjectPath = (path: string) => ObjectPath;
 
-type IsObjectBinary = (data: GetObjectCommandOutput) => boolean;
+type IsUtf8 = (data: GetObjectCommandOutput) => boolean;
 
 type SelectACL = () => Promise<ACL>;
 
@@ -25,16 +30,13 @@ type PromptConfirm = (message: string) => Promise<boolean>;
 
 type InputPrompt = (text: string) => Promise<string>;
 
-type EnsureJson = (data: string) => string;
+type EnsureJsonString = (text: string) => string;
 
-type FetchObject = (deps: {
-  client: S3Client;
-  isBinary: IsObjectBinary;
-}) => (objectPath: ObjectPath) => Promise<string | null>;
+type FetchObject = (deps: { client: S3Client; isUtf8: IsUtf8 }) => (objectPath: ObjectPath) => Promise<string | null>;
 
 type UpdateObject = (deps: {
   prompt: InputPrompt;
-  ensureJson: EnsureJson;
+  ensureJsonString: EnsureJsonString;
 }) => (objectPath: ObjectPath, prevText: string | null) => Promise<string>;
 
 type Confirm = (deps: {
@@ -50,7 +52,10 @@ class CustomError extends Error {
   }
 }
 
-const fetchObject: FetchObject = ({ client, isBinary }) => async ({ Bucket, Key }) => {
+/**
+ * Fetch s3 object
+ */
+const fetchObject: FetchObject = ({ client, isUtf8 }) => async ({ Bucket, Key }) => {
   try {
     const s3Object = await client.send(
       new GetObjectCommand({
@@ -58,8 +63,8 @@ const fetchObject: FetchObject = ({ client, isBinary }) => async ({ Bucket, Key 
         Key,
       })
     );
-    if (isBinary(s3Object)) {
-      throw new CustomError(`Cannot handle binary object.`);
+    if (!isUtf8(s3Object)) {
+      throw new CustomError(`Cannot handle non-utf8 object.`);
     }
     return s3Object.Body?.toString() || '';
   } catch (e) {
@@ -70,36 +75,162 @@ const fetchObject: FetchObject = ({ client, isBinary }) => async ({ Bucket, Key 
   }
 };
 
-const updateObject: UpdateObject = ({ prompt, ensureJson }) => async (objectPath, text) => {
+/**
+ * Update target object using terminal prompts
+ */
+const updateObject: UpdateObject = ({ prompt, ensureJsonString }) => async (objectPath, text) => {
   let updatedText = await prompt(text || '');
   if (objectPath.Ext === 'json') {
-    updatedText = ensureJson(updatedText);
+    updatedText = ensureJsonString(updatedText);
   }
   return updatedText;
 };
 
-declare const parseObjectPath: ParseObjectPath;
-declare const isBinary: IsObjectBinary;
-declare const confirm: Confirm;
-declare const pushObject: PushObject;
-declare const selectACL: SelectACL;
-declare const showDiff: ShowDiff;
-declare const ensureJson: EnsureJson;
-declare const vimPrompt: InputPrompt;
-declare const promptConfirm: PromptConfirm;
+/**
+ * Parse given commandline argument into bucket object path, or throw
+ */
+const parseObjectPath: ParseObjectPath = path => {
+  if (typeof path !== 'string') {
+    throw new CustomError(`First argument is required. e.g. 'my-bucket/target-file-path.json'`);
+  }
+  const [bucket, ...rest] = path
+    .replace(/^s3:\/\//, '')
+    .replace(/^\//, '')
+    .split('/');
+  const key = rest.join('/');
+  const ext = key.split('.').reverse()[0] ?? '';
+  if (key.length === 0) {
+    throw new CustomError(`Invalid URI argument format. e.g. 'my-bucket/target-file-path.json'`);
+  }
+  return {
+    Bucket: bucket,
+    Key: key,
+    Ext: ext,
+  };
+};
 
+const isUtf8: IsUtf8 = data => {
+  return require('utf-8-validate')(data.Body);
+};
+
+/**
+ * Ask confirm
+ */
+const confirm: Confirm = ({ promptConfirm, showDiff }) => async (objectPath, { nextText, prevText }, acl) => {
+  if (prevText != null) {
+    showDiff(prevText, nextText);
+  }
+  const yes = await promptConfirm(`Push data to ${objectPath.Bucket}/${objectPath.Key} with acl '${acl}'`);
+  if (!yes) {
+    process.exit(0);
+  }
+};
+
+/**
+ * Upload text to s3
+ */
+const pushObject: PushObject = ({ client }) => async (objectPath, data, acl) => {
+  await client.send(
+    new PutObjectCommand({
+      Bucket: objectPath.Bucket,
+      Key: objectPath.Key,
+      ContentType: 'utf-8',
+      ACL: acl,
+      Body: data,
+    })
+  );
+};
+
+/**
+ * Select ACL private vs public
+ */
+const selectACL: SelectACL = async () => {
+  const { acl } = await prompts(
+    {
+      name: 'acl',
+      type: 'select',
+      choices: [
+        { title: 'private', value: 'private', selected: true },
+        { title: 'public-read', value: 'public-read' },
+      ],
+    },
+    { onCancel: () => process.exit(0) }
+  );
+  return acl;
+};
+
+/**
+ * Print text diff on terminal
+ */
+const showDiff: ShowDiff = (prev, next) => {
+  const changes = Diff.diffLines(prev, next);
+
+  changes.forEach(change => {
+    const color = (text: string) => {
+      return change.added ? `\x1b[32m${text}\x1b[0m` : change.removed ? `\x1b[31m${text}\x1b[0m` : text;
+    };
+    console.log(color(change.value));
+  });
+};
+
+/**
+ * Ensure that given text is JSON competable, otherwise throw
+ */
+const ensureJsonString: EnsureJsonString = text => {
+  try {
+    return JSON5.stringify(JSON5.parse(text), null, 2);
+  } catch {
+    throw new CustomError(`with ext '.json' should be JSON format`);
+  }
+};
+
+/**
+ * Get text input via vim prompts
+ */
+const vimPrompt: InputPrompt = async text => {
+  const { name, removeCallback } = tmp.fileSync({ postfix: '.tmp' });
+  try {
+    fs.writeFileSync(name, text, { encoding: 'utf-8' });
+    await execa('vi', [name], { stdio: 'inherit' });
+    return fs.readFileSync(name, 'utf-8');
+  } finally {
+    removeCallback();
+  }
+};
+
+/**
+ *
+ */
+const promptConfirm: PromptConfirm = async message => {
+  const { yes } = await prompts(
+    {
+      type: 'confirm',
+      name: 'yes',
+      message,
+    },
+    { onCancel: () => process.exit(0) }
+  );
+  return yes;
+};
+
+/**
+ * Compose function with its dependencies
+ */
 function bootStrap(client: S3Client) {
   return {
-    fetch: fetchObject({ client, isBinary }),
+    fetch: fetchObject({ client, isUtf8 }),
     update: updateObject({
       prompt: vimPrompt,
-      ensureJson,
+      ensureJsonString,
     }),
     confirm: confirm({ promptConfirm, showDiff }),
     push: pushObject({ client }),
   } as const;
 }
 
+/**
+ * Main execution begins here.
+ */
 async function main(path: string) {
   try {
     const objectPath = parseObjectPath(path);
@@ -107,6 +238,12 @@ async function main(path: string) {
 
     const prevText = await fetch(objectPath);
     const nextText = await update(objectPath, prevText);
+
+    if (prevText === nextText) {
+      console.log(`No changes.`);
+      process.exit(0);
+    }
+
     const acl = await selectACL();
     await confirm(objectPath, { nextText, prevText }, acl);
     await push(objectPath, nextText, acl);
