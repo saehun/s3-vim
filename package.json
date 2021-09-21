@@ -20,6 +20,7 @@
   "devDependencies": {
     "@types/jest": "^26.0.24",
     "@types/node": "^16.0.1",
+    "@types/prompts": "^2.0.14",
     "@typescript-eslint/eslint-plugin": "^4.28.2",
     "@typescript-eslint/parser": "^4.28.2",
     "eslint": "^7.30.0",
@@ -33,6 +34,9 @@
     "*.js",
     "dist"
   ],
+  "bin": {
+    "s3-vim": "dist/index.js"
+  },
   "jest": {
     "collectCoverage": true,
     "coverageDirectory": "./coverage/",
@@ -49,5 +53,11 @@
     },
     "testEnvironment": "node",
     "preset": "ts-jest"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.33.0",
+    "diff": "^5.0.0",
+    "json5": "^2.2.0",
+    "prompts": "^2.4.1"
   }
 }
