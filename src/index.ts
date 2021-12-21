@@ -147,7 +147,7 @@ const pushObject: PushObject = ({ client }) => async (objectPath, data, acl) => 
     new PutObjectCommand({
       Bucket: objectPath.Bucket,
       Key: objectPath.Key,
-      ContentType: objectPath.Ext === 'json' ? 'application/json' : 'text/plain',
+      ContentType: objectPath.Ext === 'json' ? 'application/json; charset=utf-8' : 'text/plain; charset=utf-8',
       ContentEncoding: 'utf-8',
       ACL: acl,
       Body: data,
